@@ -7,6 +7,8 @@ Picture and audio (and subtitles) are kept; only the frame changes.
 
     dotnet run --project src/Cropsmith            # or: Cropsmith.exe [optional video path]
 
+The header shows when the running build was compiled (`built yyyy-MM-dd HH:mm`, local time), so you can tell a stale exe at a glance.
+
 Or publish a single exe: `dotnet publish src/Cropsmith -c Release -r win-x64 --self-contained false -p:PublishSingleFile=true -o dist`
 
 ## Modes
