@@ -162,34 +162,101 @@ internal static class Program
         })!;
 
     // ── one crop job: a small step machine so Esc always steps back ─────────
-    private enum Step { Mode, Size, Anchor, OutSize, Subtitles, Confirm }
+    private enum Step { Mode, Size, Anchor, OutSize, Ratio, Width, Fit, Subtitles, Confirm }
+
+    private static readonly Dictionary<string, string> RatioHints = new()
+    {
+        ["9:16"] = "Reels · Shorts · TikTok · Stories",
+        ["4:5"] = "Instagram portrait feed",
+        ["1:1"] = "Square",
+        ["3:4"] = "Portrait",
+        ["2:3"] = "Portrait photo",
+        ["16:9"] = "Widescreen · YouTube",
+        ["4:3"] = "Classic",
+        ["21:9"] = "Ultrawide",
+    };
 
     private static async Task RunOneAsync(CropService svc, string source)
     {
-        var info = await AnsiConsole.Status().Spinner(Spinner.Known.Dots).StartAsync("Reading video…", _ => svc.ProbeAsync(source));
+        var info = await AnsiConsole.Status().Spinner(Spinner.Known.Dots).StartAsync("Reading video…", _ => svc.ProbeFullAsync(source));
         ShowInfo(source, info);
 
         var mode = CropMode.Smart;
         DetectedContent? content = null;
         int? w = null, h = null, ow = null, oh = null;
-        var subtitlesOn = true;
+        var ratio = AspectRatios.Presets[0];
+        int? ratioWidth = null;
+        int tw = 0, th = 0;
+        var fill = false;
+        var subtitlesOn = info.SubtitlesOnByDefault;
         var anchor = Anchor.Center;
         int x = 0, y = 0;
         CropPlan? plan = null;
         var step = Step.Mode;
+
+        Step BeforeSubtitles() => mode switch
+        {
+            CropMode.Manual => Step.OutSize,
+            CropMode.Ratio => fill ? Step.Anchor : Step.Fit,
+            _ => Step.Size,
+        };
+        Step BeforeConfirm() => info.HasSubtitles ? Step.Subtitles : BeforeSubtitles();
 
         while (true)
         {
             switch (step)
             {
                 case Step.Mode:
-                    mode = Prompts.Select("How should it be cropped?", new[] { CropMode.Smart, CropMode.Exact },
-                        m => m == CropMode.Smart
-                            ? "[orange1]Smart[/]  – find the picture, trim the empty space, fit it to my width × height"
-                            : "[orange1]Exact[/]  – cut a precise region out of the frame, then fit it to my output size",
-                        initial: mode == CropMode.Smart ? 0 : 1);
-                    if (mode == CropMode.Smart && content is null) content = await DetectAsync(svc, source, info);
-                    step = Step.Size;
+                    var modes = new[] { CropMode.Smart, CropMode.Ratio, CropMode.Manual };
+                    mode = Prompts.Select("How should it be cropped?", modes,
+                        m => m switch
+                        {
+                            CropMode.Smart => "[orange1]Smart[/]  – find the picture, trim the empty space, fit it to my width × height",
+                            CropMode.Ratio => "[orange1]Ratio[/]  – pick a shape (9:16, 4:5, …) and a width; the height follows",
+                            _ => "[orange1]Manual[/] – cut a region I choose out of the frame, then fit it to my output size",
+                        },
+                        initial: Array.IndexOf(modes, mode));
+                    if (mode != CropMode.Manual && content is null) content = await DetectAsync(svc, source, info);
+                    step = mode == CropMode.Ratio ? Step.Ratio : Step.Size;
+                    break;
+
+                case Step.Ratio:
+                    try
+                    {
+                        var choices = AspectRatios.Presets.Append(default).ToList();
+                        ratio = Prompts.Select("Which shape?", choices,
+                            r => r.Width == 0
+                                ? "Custom  [grey]type your own W:H[/]"
+                                : $"[orange1]{r.Label,-5}[/] [grey]{RatioHints.GetValueOrDefault(r.Label, "")}[/]",
+                            initial: Math.Max(0, choices.IndexOf(ratio)));
+                        if (ratio.Width == 0)
+                            ratio = Prompts.Ask<AspectRatio>("Shape (W:H):", "", s =>
+                                AspectRatio.TryParse(s, out var r) ? (r, null) : (default, "Use two whole numbers like 4:5."));
+                    }
+                    catch (BackException) { step = Step.Mode; break; }
+                    step = Step.Width;
+                    break;
+
+                case Step.Width:
+                    try { ratioWidth = AskWidth(ratioWidth?.ToString() ?? ""); }
+                    catch (BackException) { step = Step.Ratio; break; }
+                    (tw, th) = ratio.Dimensions(ratioWidth.Value);
+                    AnsiConsole.MarkupLine($"[grey]→ {tw}×{th}  ({ratio.Label})[/]");
+                    step = Step.Fit;
+                    break;
+
+                case Step.Fit:
+                    try
+                    {
+                        fill = Prompts.Select("Fit or fill?", new[] { false, true },
+                            f => f ? "[orange1]Fill[/] – crop the picture to the shape, no bars"
+                                   : "[orange1]Fit[/]  – keep the whole picture and pad the rest",
+                            initial: fill ? 1 : 0);
+                    }
+                    catch (BackException) { step = Step.Width; break; }
+                    if (fill) { step = Step.Anchor; break; }
+                    step = TryPlan(() => CropPlanner.Smart(content!.Box, tw, th, content.PadColor), out plan)
+                        ? AfterPlan(info) : Step.Width;
                     break;
 
                 case Step.Size:
@@ -202,7 +269,7 @@ internal static class Program
                         h = AskEven($"{what} [orange1]height[/] (px):", defH);
                     }
                     catch (BackException) { step = Step.Mode; break; }
-                    if (mode == CropMode.Exact) { step = Step.Anchor; break; }
+                    if (mode == CropMode.Manual) { step = Step.Anchor; break; }
                     step = TryPlan(() => CropPlanner.Smart(content!.Box, w!.Value, h!.Value, content.PadColor), out plan)
                         ? AfterPlan(info) : Step.Size;
                     break;
@@ -210,17 +277,24 @@ internal static class Program
                 case Step.Anchor:
                     try
                     {
-                        anchor = Prompts.Select("Where should the region sit?",
+                        anchor = Prompts.Select(mode == CropMode.Ratio ? "Which part of the picture should be kept?" : "Where should the region sit?",
                             new[] { Anchor.Center, Anchor.TopLeft, Anchor.Custom },
                             a => a switch { Anchor.Center => "Centered", Anchor.TopLeft => "Top-left corner", _ => "Custom X, Y" },
                             initial: (int)anchor);
                         if (anchor == Anchor.Custom)
                         {
-                            x = AskInt("X offset:", x);
-                            y = AskInt("Y offset:", y);
+                            var within = mode == CropMode.Ratio ? " (from the picture's left edge)" : "";
+                            x = AskInt($"X offset{within}:", x);
+                            y = AskInt($"Y offset{(mode == CropMode.Ratio ? " (from the picture's top edge)" : "")}:", y);
                         }
                     }
-                    catch (BackException) { step = Step.Size; break; }
+                    catch (BackException) { step = mode == CropMode.Ratio ? Step.Fit : Step.Size; break; }
+                    if (mode == CropMode.Ratio)
+                    {
+                        step = TryPlan(() => CropPlanner.Fill(content!.Box, tw, th, anchor, content.PadColor, x, y), out plan)
+                            ? AfterPlan(info) : Step.Fit;
+                        break;
+                    }
                     step = Step.OutSize;
                     break;
 
@@ -238,22 +312,27 @@ internal static class Program
                 case Step.Subtitles:
                     try
                     {
-                        subtitlesOn = !Prompts.Confirm("This video has subtitles. Turn them [orange1]off by default[/]? [grey](they stay in the file; switch them on in your player)[/]",
-                            defaultYes: !subtitlesOn);
+                        subtitlesOn = Prompts.Select(
+                            $"Subtitles are [orange1]{(info.SubtitlesOnByDefault ? "on" : "off")}[/] by default in this video. In the cropped one:",
+                            new[] { true, false },
+                            on => on ? "On by default" : "Off by default [grey](still in the file; switch them on in your player)[/]",
+                            initial: subtitlesOn ? 0 : 1);
                     }
-                    catch (BackException) { step = mode == CropMode.Exact ? Step.OutSize : Step.Size; break; }
+                    catch (BackException) { step = BeforeSubtitles(); break; }
                     step = Step.Confirm;
                     break;
 
                 case Step.Confirm:
                     var output = OutputNamer.Next(source, File.Exists);
                     ShowPlan(plan!, info, output);
+                    if (plan!.ScaleFactor > 1.0001)
+                        AnsiConsole.MarkupLine($"[yellow]Enlarging the picture ×{plan.ScaleFactor:0.##} — it may look softer.[/]");
                     if (info.HasSubtitles)
                         AnsiConsole.MarkupLine($"[grey]Subtitles:[/] {(subtitlesOn ? "on by default" : "off by default (still in the file)")}");
                     bool go;
                     try { go = Prompts.Confirm("Start cropping?"); }
-                    catch (BackException) { step = info.HasSubtitles ? Step.Subtitles : mode == CropMode.Exact ? Step.OutSize : Step.Size; break; }
-                    if (!go) { step = Step.Size; break; }
+                    catch (BackException) { step = BeforeConfirm(); break; }
+                    if (!go) { step = mode == CropMode.Ratio ? Step.Fit : Step.Size; break; }
                     await CropWithProgressAsync(svc, source, output, plan!, info, subtitlesOn);
                     return;
             }
@@ -327,6 +406,10 @@ internal static class Program
         catch (BackException) { }
     }
 
+    private static int AskWidth(string initial) =>
+        Prompts.Ask("Output [orange1]width[/]  (px):", initial, s =>
+            int.TryParse(s.Trim(), out var v) && v > 0 && v % 2 == 0 ? (v, null) : (0, "Use a positive, even whole number."));
+
     private static int AskEven(string prompt, int def) =>
         Prompts.Ask(prompt, def.ToString(), s =>
             int.TryParse(s.Trim(), out var v) && v > 0 && v % 2 == 0 ? (v, null) : (0, "Use a positive, even whole number."));
@@ -342,7 +425,7 @@ internal static class Program
         t.AddRow("[grey]Frame[/]", $"{i.Width}×{i.Height}");
         t.AddRow("[grey]Length[/]", i.Duration.ToString(@"h\:mm\:ss"));
         t.AddRow("[grey]Audio[/]", i.AudioCodec ?? "none");
-        if (i.HasSubtitles) t.AddRow("[grey]Subtitles[/]", "yes");
+        if (i.HasSubtitles) t.AddRow("[grey]Subtitles[/]", $"yes · {(i.SubtitlesOnByDefault ? "on" : "off")} by default");
         AnsiConsole.Write(t);
     }
 

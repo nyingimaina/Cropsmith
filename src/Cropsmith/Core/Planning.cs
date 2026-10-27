@@ -8,16 +8,21 @@ public readonly record struct CropBox(int X, int Y, int Width, int Height)
     public long Area => (long)Width * Height;
 }
 
-public enum CropMode { Smart, Exact }
+public enum CropMode { Smart, Ratio, Manual }
 
 public enum Anchor { Center, TopLeft, Custom }
 
-public sealed record VideoInfo(int Width, int Height, TimeSpan Duration, string? AudioCodec, bool HasSubtitles);
+public sealed record VideoInfo(int Width, int Height, TimeSpan Duration, string? AudioCodec, bool HasSubtitles)
+{
+    /// <summary>Whether the source's subtitle track is flagged to show by default. Only filled in by <see cref="VideoProbe.ParseFull"/>.</summary>
+    public bool SubtitlesOnByDefault { get; init; }
+}
 
 public sealed record CropPlan(CropBox Crop, int ScaleWidth, int ScaleHeight, int OutWidth, int OutHeight, string PadColor)
 {
     public bool NeedsScale => ScaleWidth != Crop.Width || ScaleHeight != Crop.Height;
     public bool NeedsPad => OutWidth != ScaleWidth || OutHeight != ScaleHeight;
+    public double ScaleFactor => (double)ScaleWidth / Crop.Width;
 }
 
 public sealed record DetectedContent(CropBox Box, string PadColor);
@@ -80,6 +85,39 @@ public static class CropPlanner
 
         var factor = Math.Min((double)targetWidth / content.Width, (double)targetHeight / content.Height);
         return new(content, Even(content.Width * factor), Even(content.Height * factor), targetWidth, targetHeight, padColor);
+    }
+
+    /// <summary>
+    /// Fill the output: crop the largest window with the target's aspect out of <paramref name="content"/>, then scale it up or down.
+    /// A custom offset is measured from the content box's top-left corner.
+    /// </summary>
+    public static CropPlan Fill(CropBox content, int targetWidth, int targetHeight, Anchor anchor, string padColor, int x = 0, int y = 0)
+    {
+        RequireEven(targetWidth, targetHeight);
+
+        int w, h;
+        if ((long)content.Width * targetHeight > (long)content.Height * targetWidth)
+        {
+            h = content.Height;
+            w = (int)((long)h * targetWidth / targetHeight);
+        }
+        else
+        {
+            w = content.Width;
+            h = (int)((long)w * targetHeight / targetWidth);
+        }
+        (w, h) = (Math.Max(2, w & ~1), Math.Max(2, h & ~1));
+
+        (x, y) = anchor switch
+        {
+            Anchor.Center => ((content.Width - w) / 2, (content.Height - h) / 2),
+            Anchor.TopLeft => (0, 0),
+            _ => (x, y),
+        };
+        if (x < 0 || y < 0 || x + w > content.Width || y + h > content.Height)
+            throw new ArgumentException($"A {w}x{h} crop at ({x},{y}) falls outside the {content.Width}x{content.Height} picture.");
+
+        return Smart(new CropBox(content.X + x, content.Y + y, w, h), targetWidth, targetHeight, padColor);
     }
 
     /// <summary>Cut a user-chosen region out of the frame, then scale/pad it to the output size (black bars).</summary>

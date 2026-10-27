@@ -27,6 +27,17 @@ public static class VideoProbe
             streams.Any(s => Type(s) == "subtitle"));
     }
 
+    /// <summary>As <see cref="Parse"/>, plus whether the subtitles are on by default in the source.</summary>
+    public static VideoInfo ParseFull(string json)
+    {
+        var info = Parse(json);
+        using var doc = JsonDocument.Parse(json);
+        var onByDefault = doc.RootElement.GetProperty("streams").EnumerateArray()
+            .Where(s => Type(s) == "subtitle")
+            .Any(s => s.TryGetProperty("disposition", out var d) && d.TryGetProperty("default", out var v) && v.ValueKind == JsonValueKind.Number && v.GetInt32() == 1);
+        return info with { SubtitlesOnByDefault = onByDefault };
+    }
+
     private static string? Type(JsonElement s) => s.TryGetProperty("codec_type", out var t) ? t.GetString() : null;
 }
 

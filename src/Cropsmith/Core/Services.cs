@@ -120,6 +120,15 @@ public sealed class CropService(string ffmpeg, string ffprobe)
         return VideoProbe.Parse(r.StdOut);
     }
 
+    /// <summary>As <see cref="ProbeAsync"/>, also reporting whether the source's subtitles are on by default.</summary>
+    public async Task<VideoInfo> ProbeFullAsync(string path, CancellationToken ct = default)
+    {
+        var r = await ProcessRunner.RunAsync(ffprobe,
+            ["-v", "error", "-print_format", "json", "-show_streams", "-show_format", path], ct: ct);
+        if (r.ExitCode != 0) throw new InvalidOperationException($"ffprobe could not read the file:\n{r.StdErr.Trim()}");
+        return VideoProbe.ParseFull(r.StdOut);
+    }
+
     /// <summary>Finds the real picture area by sampling frames against both a white and a black background.</summary>
     public async Task<DetectedContent?> DetectContentAsync(string path, VideoInfo info, CancellationToken ct = default)
     {
