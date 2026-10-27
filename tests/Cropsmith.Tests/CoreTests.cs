@@ -99,39 +99,16 @@ public class CropPlannerTests
         Assert.Throws<ArgumentException>(() => CropPlanner.Smart(new CropBox(0, 0, 10, 10), w, h, "white"));
 
     [Fact]
-    public void Exact_CentersTheWindow()
+    public void Region_SameOutputSize_IsAPlainCrop()
     {
-        var plan = CropPlanner.Exact(Src, 800, 600, Anchor.Center);
-        Assert.Equal(new CropBox(560, 240, 800, 600), plan.Crop);
+        var plan = CropPlanner.Region(Src, 800, 600, Anchor.Center, 0, 0, 800, 600);
+        Assert.Equal(new CropPlan(new CropBox(560, 240, 800, 600), 800, 600, 800, 600, "black"), plan);
         Assert.Equal("crop=800:600:560:240,setsar=1", FilterBuilder.Build(plan));
     }
 
     [Fact]
-    public void Exact_TopLeft() =>
-        Assert.Equal(new CropBox(0, 0, 800, 600), CropPlanner.Exact(Src, 800, 600, Anchor.TopLeft).Crop);
-
-    [Fact]
-    public void Exact_Custom_UsesGivenOffset() =>
-        Assert.Equal(new CropBox(40, 14, 578, 1034 - 2), CropPlanner.Exact(Src, 578, 1032, Anchor.Custom, 40, 14).Crop);
-
-    [Fact]
-    public void Exact_RejectsTargetLargerThanSource() =>
-        Assert.Throws<ArgumentException>(() => CropPlanner.Exact(Src, 2000, 600, Anchor.Center));
-
-    [Fact]
-    public void Exact_RejectsCustomOffsetThatFallsOutside() =>
-        Assert.Throws<ArgumentException>(() => CropPlanner.Exact(Src, 800, 600, Anchor.Custom, 1200, 0));
-
-    [Fact]
-    public void Exact_RejectsOddSizes() =>
-        Assert.Throws<ArgumentException>(() => CropPlanner.Exact(Src, 801, 600, Anchor.Center));
-
-    [Fact]
-    public void Region_SameOutputSize_MatchesExact()
-    {
-        var region = CropPlanner.Region(Src, 800, 600, Anchor.Center, 0, 0, 800, 600);
-        Assert.Equal(CropPlanner.Exact(Src, 800, 600, Anchor.Center), region);
-    }
+    public void Region_TopLeft() =>
+        Assert.Equal(new CropBox(0, 0, 800, 600), CropPlanner.Region(Src, 800, 600, Anchor.TopLeft, 0, 0, 800, 600).Crop);
 
     [Fact]
     public void Region_ScalesAndPadsToTallerOutput()

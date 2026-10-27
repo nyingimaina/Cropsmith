@@ -82,24 +82,6 @@ public static class CropPlanner
         return new(content, Even(content.Width * factor), Even(content.Height * factor), targetWidth, targetHeight, padColor);
     }
 
-    public static CropPlan Exact(VideoInfo source, int width, int height, Anchor anchor, int x = 0, int y = 0)
-    {
-        RequireEven(width, height);
-        if (width > source.Width || height > source.Height)
-            throw new ArgumentException($"{width}x{height} is larger than the source ({source.Width}x{source.Height}).");
-
-        (x, y) = anchor switch
-        {
-            Anchor.Center => ((source.Width - width) / 2, (source.Height - height) / 2),
-            Anchor.TopLeft => (0, 0),
-            _ => (x, y),
-        };
-        if (x < 0 || y < 0 || x + width > source.Width || y + height > source.Height)
-            throw new ArgumentException($"A {width}x{height} window at ({x},{y}) falls outside the {source.Width}x{source.Height} frame.");
-
-        return new(new CropBox(x, y, width, height), width, height, width, height, "black");
-    }
-
     /// <summary>Cut a user-chosen region out of the frame, then scale/pad it to the output size (black bars).</summary>
     public static CropPlan Region(VideoInfo source, int width, int height, Anchor anchor, int x, int y, int outWidth, int outHeight)
     {
