@@ -162,7 +162,7 @@ internal static class Program
         })!;
 
     // ── one crop job: a small step machine so Esc always steps back ─────────
-    private enum Step { Mode, Size, Anchor, Confirm }
+    private enum Step { Mode, Size, Anchor, OutSize, Subtitles, Confirm }
 
     private static async Task RunOneAsync(CropService svc, string source)
     {
@@ -171,7 +171,8 @@ internal static class Program
 
         var mode = CropMode.Smart;
         DetectedContent? content = null;
-        int? w = null, h = null;
+        int? w = null, h = null, ow = null, oh = null;
+        var subtitlesOn = true;
         var anchor = Anchor.Center;
         int x = 0, y = 0;
         CropPlan? plan = null;
@@ -185,7 +186,7 @@ internal static class Program
                     mode = Prompts.Select("How should it be cropped?", new[] { CropMode.Smart, CropMode.Exact },
                         m => m == CropMode.Smart
                             ? "[orange1]Smart[/]  – find the picture, trim the empty space, fit it to my width × height"
-                            : "[orange1]Exact[/]  – cut a precise width × height window out of the frame",
+                            : "[orange1]Exact[/]  – cut a precise region out of the frame, then fit it to my output size",
                         initial: mode == CropMode.Smart ? 0 : 1);
                     if (mode == CropMode.Smart && content is null) content = await DetectAsync(svc, source, info);
                     step = Step.Size;
@@ -196,19 +197,20 @@ internal static class Program
                     {
                         var defW = w ?? ((mode == CropMode.Smart ? content!.Box.Width : info.Width) & ~1);
                         var defH = h ?? ((mode == CropMode.Smart ? content!.Box.Height : info.Height) & ~1);
-                        w = AskEven("Output [orange1]width[/]  (px):", defW);
-                        h = AskEven("Output [orange1]height[/] (px):", defH);
+                        var what = mode == CropMode.Smart ? "Output" : "Region";
+                        w = AskEven($"{what} [orange1]width[/]  (px):", defW);
+                        h = AskEven($"{what} [orange1]height[/] (px):", defH);
                     }
                     catch (BackException) { step = Step.Mode; break; }
-                    step = mode == CropMode.Exact ? Step.Anchor : Step.Confirm;
-                    if (mode == CropMode.Smart && !TryPlan(() => CropPlanner.Smart(content!.Box, w!.Value, h!.Value, content.PadColor), out plan))
-                        step = Step.Size;
+                    if (mode == CropMode.Exact) { step = Step.Anchor; break; }
+                    step = TryPlan(() => CropPlanner.Smart(content!.Box, w!.Value, h!.Value, content.PadColor), out plan)
+                        ? AfterPlan(info) : Step.Size;
                     break;
 
                 case Step.Anchor:
                     try
                     {
-                        anchor = Prompts.Select("Where should the window sit?",
+                        anchor = Prompts.Select("Where should the region sit?",
                             new[] { Anchor.Center, Anchor.TopLeft, Anchor.Custom },
                             a => a switch { Anchor.Center => "Centered", Anchor.TopLeft => "Top-left corner", _ => "Custom X, Y" },
                             initial: (int)anchor);
@@ -219,21 +221,46 @@ internal static class Program
                         }
                     }
                     catch (BackException) { step = Step.Size; break; }
-                    step = TryPlan(() => CropPlanner.Exact(info, w!.Value, h!.Value, anchor, x, y), out plan) ? Step.Confirm : Step.Size;
+                    step = Step.OutSize;
+                    break;
+
+                case Step.OutSize:
+                    try
+                    {
+                        ow = AskEven("Output [orange1]width[/]  (px):", ow ?? w!.Value);
+                        oh = AskEven("Output [orange1]height[/] (px):", oh ?? h!.Value);
+                    }
+                    catch (BackException) { step = Step.Anchor; break; }
+                    step = TryPlan(() => CropPlanner.Region(info, w!.Value, h!.Value, anchor, x, y, ow!.Value, oh!.Value), out plan)
+                        ? AfterPlan(info) : Step.Size;
+                    break;
+
+                case Step.Subtitles:
+                    try
+                    {
+                        subtitlesOn = !Prompts.Confirm("This video has subtitles. Turn them [orange1]off by default[/]? [grey](they stay in the file; switch them on in your player)[/]",
+                            defaultYes: !subtitlesOn);
+                    }
+                    catch (BackException) { step = mode == CropMode.Exact ? Step.OutSize : Step.Size; break; }
+                    step = Step.Confirm;
                     break;
 
                 case Step.Confirm:
                     var output = OutputNamer.Next(source, File.Exists);
                     ShowPlan(plan!, info, output);
+                    if (info.HasSubtitles)
+                        AnsiConsole.MarkupLine($"[grey]Subtitles:[/] {(subtitlesOn ? "on by default" : "off by default (still in the file)")}");
                     bool go;
                     try { go = Prompts.Confirm("Start cropping?"); }
-                    catch (BackException) { step = mode == CropMode.Exact ? Step.Anchor : Step.Size; break; }
+                    catch (BackException) { step = info.HasSubtitles ? Step.Subtitles : mode == CropMode.Exact ? Step.OutSize : Step.Size; break; }
                     if (!go) { step = Step.Size; break; }
-                    await CropWithProgressAsync(svc, source, output, plan!, info);
+                    await CropWithProgressAsync(svc, source, output, plan!, info, subtitlesOn);
                     return;
             }
         }
     }
+
+    private static Step AfterPlan(VideoInfo info) => info.HasSubtitles ? Step.Subtitles : Step.Confirm;
 
     private static async Task<DetectedContent> DetectAsync(CropService svc, string source, VideoInfo info)
     {
@@ -260,7 +287,7 @@ internal static class Program
         }
     }
 
-    private static async Task CropWithProgressAsync(CropService svc, string source, string output, CropPlan plan, VideoInfo info)
+    private static async Task CropWithProgressAsync(CropService svc, string source, string output, CropPlan plan, VideoInfo info, bool subtitlesOn)
     {
         using var job = new CancellationTokenSource();
         using var stop = new CancellationTokenSource();
@@ -272,7 +299,7 @@ internal static class Program
                 .StartAsync(async ctx =>
                 {
                     var task = ctx.AddTask("Cropping [grey](Esc to cancel)[/]", maxValue: 1);
-                    await svc.CropAsync(source, output, plan, info, new Progress<double>(v => task.Value = v), job.Token);
+                    await svc.CropAsync(source, output, plan, info, subtitlesOn, new Progress<double>(v => task.Value = v), job.Token);
                 });
         }
         catch (OperationCanceledException)

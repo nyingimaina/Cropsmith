@@ -13,7 +13,11 @@ Or publish a single exe: `dotnet publish src/Cropsmith -c Release -r win-x64 --s
 
 - **Smart** – samples ~120 frames, finds the picture against a white or black background, trims the empty space,
   then scales to your width × height (padding only if the aspect ratio differs by more than 1%).
-- **Exact** – cuts a precise width × height window (centered, top-left, or custom X/Y). No scaling.
+- **Exact** – you give the region to keep (width × height, centered, top-left, or custom X/Y), then the output size.
+  The region is scaled to fit and padded with black, like Smart. Output size defaults to the region size, which is a plain crop.
+
+If the video has subtitles you're asked whether to turn them off by default. They stay in the file as a selectable
+track; only the "on by default" flag is cleared.
 
 ## Dependencies
 

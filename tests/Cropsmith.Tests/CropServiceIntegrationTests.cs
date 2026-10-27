@@ -49,6 +49,40 @@ public class CropServiceIntegrationTests : IDisposable
         Assert.Equal(2, outInfo.Duration.TotalSeconds, 0.3);
     }
 
+    [Theory]
+    [InlineData(false, "0")]
+    [InlineData(true, "1")]
+    public async Task Subtitles_KeepTheTrack_AndHonourTheDefaultFlag(bool onByDefault, string expectedDefault)
+    {
+        var tools = ToolLocator.TryLocate();
+        if (tools is null) return;
+        var svc = new CropService(tools.Value.Ffmpeg, tools.Value.Ffprobe);
+
+        var srt = Path.Combine(_dir, "s.srt");
+        await File.WriteAllTextAsync(srt, "1\n00:00:00,000 --> 00:00:01,000\nhello\n");
+        var src = Path.Combine(_dir, "subs.mp4");
+        var made = await ProcessRunner.RunAsync(tools.Value.Ffmpeg, new[]
+        {
+            "-hide_banner", "-loglevel", "error", "-y",
+            "-f", "lavfi", "-i", "color=white:s=320x240:d=2:r=10", "-i", srt,
+            "-c:v", "libx264", "-pix_fmt", "yuv420p", "-c:s", "mov_text", src,
+        });
+        Assert.Equal(0, made.ExitCode);
+
+        var info = await svc.ProbeAsync(src);
+        Assert.True(info.HasSubtitles);
+        var plan = CropPlanner.Region(info, 160, 120, Anchor.Center, 0, 0, 160, 120);
+        var dst = Path.Combine(_dir, "subs_out.mp4");
+        await svc.CropAsync(src, dst, plan, info, onByDefault);
+
+        Assert.True((await svc.ProbeAsync(dst)).HasSubtitles);
+        var probe = await ProcessRunner.RunAsync(tools.Value.Ffprobe, new[]
+        {
+            "-v", "error", "-select_streams", "s", "-show_entries", "stream_disposition=default", "-of", "csv=p=0", dst,
+        });
+        Assert.Equal(expectedDefault, probe.StdOut.Trim());
+    }
+
     [Fact]
     public async Task CropAsync_Throws_OnBadInput()
     {

@@ -100,6 +100,25 @@ public static class CropPlanner
         return new(new CropBox(x, y, width, height), width, height, width, height, "black");
     }
 
+    /// <summary>Cut a user-chosen region out of the frame, then scale/pad it to the output size (black bars).</summary>
+    public static CropPlan Region(VideoInfo source, int width, int height, Anchor anchor, int x, int y, int outWidth, int outHeight)
+    {
+        RequireEven(width, height);
+        if (width > source.Width || height > source.Height)
+            throw new ArgumentException($"A {width}x{height} region is larger than the source ({source.Width}x{source.Height}).");
+
+        (x, y) = anchor switch
+        {
+            Anchor.Center => ((source.Width - width) / 2, (source.Height - height) / 2),
+            Anchor.TopLeft => (0, 0),
+            _ => (x, y),
+        };
+        if (x < 0 || y < 0 || x + width > source.Width || y + height > source.Height)
+            throw new ArgumentException($"A {width}x{height} region at ({x},{y}) falls outside the {source.Width}x{source.Height} frame.");
+
+        return Smart(new CropBox(x, y, width, height), outWidth, outHeight, "black");
+    }
+
     private static void RequireEven(int w, int h)
     {
         if (w <= 0 || h <= 0 || w % 2 != 0 || h % 2 != 0)
@@ -145,8 +164,7 @@ public static class FfmpegArgsBuilder
         if (source.HasSubtitles) a.AddRange(["-c:s", "mov_text"]);
         a.AddRange(["-movflags", "+faststart", output]);
         return a;
-    }
-}
+    }}
 
 public static class ProgressParser
 {

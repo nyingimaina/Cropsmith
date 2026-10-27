@@ -161,6 +161,40 @@ public sealed class CropService(string ffmpeg, string ffprobe)
         }
         progress?.Report(1);
     }
+
+    /// <summary>As <see cref="CropAsync(string,string,CropPlan,VideoInfo,IProgress{double}?,CancellationToken)"/>, with a say over whether subtitles show by default.</summary>
+    public async Task CropAsync(string input, string output, CropPlan plan, VideoInfo info, bool subtitlesOnByDefault,
+        IProgress<double>? progress = null, CancellationToken ct = default)
+    {
+        var args = FfmpegArgsBuilder.Build(input, output, FilterBuilder.Build(plan), info);
+        ProcessResult r;
+        try
+        {
+            r = await ProcessRunner.RunAsync(ffmpeg, args, line =>
+            {
+                if (progress is not null && info.Duration > TimeSpan.Zero && ProgressParser.TryGetElapsed(line, out var t))
+                    progress.Report(Math.Clamp(t / info.Duration, 0, 1));
+            }, ct);
+        }
+        catch (OperationCanceledException)
+        {
+            try { File.Delete(output); } catch { }
+            throw;
+        }
+
+        if (r.ExitCode != 0)
+        {
+            try { File.Delete(output); } catch { }
+            throw new InvalidOperationException($"ffmpeg failed (exit {r.ExitCode}):\n{r.StdErr.Trim()}");
+        }
+
+        if (info.HasSubtitles && !subtitlesOnByDefault)
+        {
+            using var file = new FileStream(output, FileMode.Open, FileAccess.ReadWrite);
+            Mp4Tracks.DisableSubtitleTracks(file);
+        }
+        progress?.Report(1);
+    }
 }
 
 

@@ -125,6 +125,61 @@ public class CropPlannerTests
     [Fact]
     public void Exact_RejectsOddSizes() =>
         Assert.Throws<ArgumentException>(() => CropPlanner.Exact(Src, 801, 600, Anchor.Center));
+
+    [Fact]
+    public void Region_SameOutputSize_MatchesExact()
+    {
+        var region = CropPlanner.Region(Src, 800, 600, Anchor.Center, 0, 0, 800, 600);
+        Assert.Equal(CropPlanner.Exact(Src, 800, 600, Anchor.Center), region);
+    }
+
+    [Fact]
+    public void Region_ScalesAndPadsToTallerOutput()
+    {
+        var plan = CropPlanner.Region(Src, 800, 1000, Anchor.Center, 0, 0, 768, 1376);
+        Assert.Equal(new CropBox(560, 40, 800, 1000), plan.Crop);
+        Assert.Equal((768, 1376), (plan.OutWidth, plan.OutHeight));
+        Assert.True(plan.NeedsScale);
+        Assert.True(plan.NeedsPad);
+        Assert.Equal("black", plan.PadColor);
+        Assert.Equal((768, 960), (plan.ScaleWidth, plan.ScaleHeight));
+    }
+
+    [Fact]
+    public void Region_AspectWithinTolerance_StretchesWithoutPadding()
+    {
+        var plan = CropPlanner.Region(Src, 608, 1080, Anchor.Center, 0, 0, 768, 1376);
+        Assert.False(plan.NeedsPad);
+        Assert.Equal((768, 1376), (plan.ScaleWidth, plan.ScaleHeight));
+    }
+
+    [Fact]
+    public void Region_AllowsOutputLargerThanSource() =>
+        Assert.Equal((768, 1376), (CropPlanner.Region(Src, 608, 1080, Anchor.TopLeft, 0, 0, 768, 1376).OutWidth, 1376));
+
+    [Fact]
+    public void Region_Custom_UsesGivenOffset() =>
+        Assert.Equal(new CropBox(40, 14, 578, 1032), CropPlanner.Region(Src, 578, 1032, Anchor.Custom, 40, 14, 768, 1376).Crop);
+
+    [Fact]
+    public void Region_RejectsRegionLargerThanSource() =>
+        Assert.Throws<ArgumentException>(() => CropPlanner.Region(Src, 2000, 600, Anchor.Center, 0, 0, 800, 600));
+
+    [Fact]
+    public void Region_RejectsRegionTallerThanSource() =>
+        Assert.Throws<ArgumentException>(() => CropPlanner.Region(Src, 768, 1376, Anchor.TopLeft, 0, 0, 768, 1376));
+
+    [Fact]
+    public void Region_RejectsCustomOffsetThatFallsOutside() =>
+        Assert.Throws<ArgumentException>(() => CropPlanner.Region(Src, 800, 600, Anchor.Custom, 1200, 0, 800, 600));
+
+    [Fact]
+    public void Region_RejectsOddRegion() =>
+        Assert.Throws<ArgumentException>(() => CropPlanner.Region(Src, 801, 600, Anchor.Center, 0, 0, 800, 600));
+
+    [Fact]
+    public void Region_RejectsOddOutput() =>
+        Assert.Throws<ArgumentException>(() => CropPlanner.Region(Src, 800, 600, Anchor.Center, 0, 0, 801, 600));
 }
 
 public class AudioPolicyTests
@@ -173,6 +228,89 @@ public class FfmpegArgsBuilderTests
         var a = FfmpegArgsBuilder.Build("in.mp4", "out.mp4", "f", new VideoInfo(10, 10, TimeSpan.FromSeconds(1), null, false));
         Assert.DoesNotContain("0:a?", a);
         Assert.Contains("-an", a);
+    }
+}
+
+public class Mp4SubtitleFlagTests
+{
+    private static byte[] Box(string type, params byte[][] children)
+    {
+        var body = children.SelectMany(c => c).ToArray();
+        var size = System.Buffers.Binary.BinaryPrimitives.ReverseEndianness(8 + body.Length);
+        return BitConverter.GetBytes(size).Concat(System.Text.Encoding.ASCII.GetBytes(type)).Concat(body).ToArray();
+    }
+
+    // tkhd: version 0, flags 0x000003 (enabled + in movie), then a dummy body.
+    private static byte[] Tkhd() => Box("tkhd", new byte[] { 0, 0, 0, 3 }, new byte[80]);
+
+    private static byte[] Hdlr(string handler) =>
+        Box("hdlr", new byte[] { 0, 0, 0, 0 }, new byte[4], System.Text.Encoding.ASCII.GetBytes(handler), new byte[12]);
+
+    private static byte[] Trak(string handler) => Box("trak", Tkhd(), Box("mdia", Hdlr(handler)));
+
+    private static byte[] File(params byte[][] traks) =>
+        Box("ftyp", System.Text.Encoding.ASCII.GetBytes("isom")).Concat(Box("moov", traks)).Concat(Box("mdat", new byte[16])).ToArray();
+
+    private static byte[] Flags(byte[] file, int trackIndex)
+    {
+        var at = 0;
+        for (var n = 0; n <= trackIndex; n++) at = IndexOf(file, "tkhd", at + 1);
+        return file[(at + 4)..(at + 8)];
+    }
+
+    private static int IndexOf(byte[] file, string type, int from) =>
+        file.AsSpan(from).IndexOf(System.Text.Encoding.ASCII.GetBytes(type)) + from;
+
+    [Fact]
+    public void ClearsEnabledBit_OnSubtitleTracksOnly()
+    {
+        var bytes = File(Trak("vide"), Trak("soun"), Trak("sbtl"));
+        using var ms = new MemoryStream(bytes);
+
+        var patched = Mp4Tracks.DisableSubtitleTracks(ms);
+
+        Assert.Equal(1, patched);
+        var result = ms.ToArray();
+        Assert.Equal(new byte[] { 0, 0, 0, 3 }, Flags(result, 0));
+        Assert.Equal(new byte[] { 0, 0, 0, 3 }, Flags(result, 1));
+        Assert.Equal(new byte[] { 0, 0, 0, 2 }, Flags(result, 2));
+    }
+
+    [Fact]
+    public void LeavesFileSizeAndEverythingElseAlone()
+    {
+        var bytes = File(Trak("vide"), Trak("sbtl"));
+        using var ms = new MemoryStream(bytes.ToArray());
+        Mp4Tracks.DisableSubtitleTracks(ms);
+        var diff = ms.ToArray().Zip(bytes, (a, b) => a != b).Count(x => x);
+        Assert.Equal(bytes.Length, ms.Length);
+        Assert.Equal(1, diff);
+    }
+
+    [Fact]
+    public void NoSubtitleTracks_ChangesNothing()
+    {
+        var bytes = File(Trak("vide"), Trak("soun"));
+        using var ms = new MemoryStream(bytes.ToArray());
+        Assert.Equal(0, Mp4Tracks.DisableSubtitleTracks(ms));
+        Assert.Equal(bytes, ms.ToArray());
+    }
+
+    [Fact]
+    public void IsIdempotent()
+    {
+        using var ms = new MemoryStream(File(Trak("sbtl")));
+        Mp4Tracks.DisableSubtitleTracks(ms);
+        var once = ms.ToArray();
+        Mp4Tracks.DisableSubtitleTracks(ms);
+        Assert.Equal(once, ms.ToArray());
+    }
+
+    [Fact]
+    public void GarbageInput_DoesNotThrow()
+    {
+        using var ms = new MemoryStream(new byte[] { 1, 2, 3, 4, 5 });
+        Assert.Equal(0, Mp4Tracks.DisableSubtitleTracks(ms));
     }
 }
 
