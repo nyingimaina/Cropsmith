@@ -8,32 +8,38 @@ internal static class Program
     private static async Task<int> Main(string[] args)
     {
         Console.OutputEncoding = System.Text.Encoding.UTF8;
-        using var cts = new CancellationTokenSource();
-        Console.CancelKeyPress += (_, e) => { e.Cancel = true; cts.Cancel(); };
+        Console.TreatControlCAsInput = true; // Ctrl+C arrives as a key so every screen can handle it
 
         try
         {
             Banner();
-            var tools = await EnsureToolsAsync(cts.Token);
+            var tools = await EnsureToolsAsync();
             if (tools is null) return 1;
             var svc = new CropService(tools.Value.Ffmpeg, tools.Value.Ffprobe);
 
             var first = args.Length > 0 ? PathInput.Clean(args[0]) : null;
-            do
+            while (true)
             {
-                var source = first is not null && File.Exists(first) ? first : PickSource();
-                first = null;
-                await RunOneAsync(svc, source, cts.Token);
+                try
+                {
+                    var source = first is not null && File.Exists(first) ? first : PickSource();
+                    first = null;
+                    await RunOneAsync(svc, source);
+                    if (!Prompts.Confirm("\nCrop another video?", defaultYes: false)) break;
+                }
+                catch (BackException)
+                {
+                    // Esc on the first screen of a job: offer to leave, otherwise start over.
+                    if (AskQuit()) break;
+                }
             }
-            while (AnsiConsole.Confirm("\n[grey]Crop another video?[/]", defaultValue: false));
-
-            AnsiConsole.MarkupLine("\n[grey]Happy cropping.[/]");
+            Goodbye();
             return 0;
         }
-        catch (OperationCanceledException)
+        catch (QuitException)
         {
-            AnsiConsole.MarkupLine("\n[yellow]Cancelled.[/]");
-            return 130;
+            Goodbye();
+            return 0;
         }
         catch (Exception ex)
         {
@@ -43,39 +49,66 @@ internal static class Program
         }
     }
 
+    private static bool AskQuit()
+    {
+        try { return Prompts.Confirm("Quit Cropsmith?", defaultYes: false); }
+        catch (BackException) { return false; }
+    }
+
+    private static void Goodbye() => AnsiConsole.MarkupLine("\n[grey]Happy cropping.[/]");
+
     private static void Banner()
     {
         AnsiConsole.Write(new FigletText("Cropsmith").Color(Color.Orange1));
         AnsiConsole.Write(new Rule("[grey]forge your video to the exact frame · picture and sound stay intact[/]").RuleStyle("grey").LeftJustified());
-        AnsiConsole.WriteLine();
+        AnsiConsole.MarkupLine("[grey]Keys: [bold]Enter[/] confirm · [bold]Esc[/] go back / cancel · [bold]Ctrl+C[/] or [bold]Q[/] quit[/]\n");
     }
 
     // ── dependencies ────────────────────────────────────────────────────────
-    private static async Task<(string Ffmpeg, string Ffprobe)?> EnsureToolsAsync(CancellationToken ct)
+    private static async Task<(string Ffmpeg, string Ffprobe)?> EnsureToolsAsync()
     {
         var tools = ToolLocator.TryLocate();
         if (tools is not null) return tools;
 
         AnsiConsole.MarkupLine("[yellow]Cropsmith needs [bold]ffmpeg[/], which isn't installed on this machine.[/]");
         AnsiConsole.MarkupLine($"[grey]It will be downloaded once (~100 MB) into[/] [blue]{Markup.Escape(ToolLocator.ManagedDir)}[/]");
-        if (!AnsiConsole.Confirm("Download it now?"))
+        bool yes;
+        try { yes = Prompts.Confirm("Download it now?"); }
+        catch (BackException) { yes = false; }
+        if (!yes)
         {
             AnsiConsole.MarkupLine("[red]Can't continue without ffmpeg.[/]");
             return null;
         }
 
-        await AnsiConsole.Progress()
-            .Columns(new TaskDescriptionColumn(), new ProgressBarColumn(), new PercentageColumn(), new DownloadedColumn(), new TransferSpeedColumn())
-            .StartAsync(async ctx =>
-            {
-                var task = ctx.AddTask("Downloading ffmpeg", maxValue: 100_000_000);
-                await FfmpegInstaller.InstallAsync(new Progress<(long Done, long? Total)>(p =>
+        using var job = new CancellationTokenSource();
+        using var stop = new CancellationTokenSource();
+        var watcher = Prompts.Watch(job, stop.Token);
+        try
+        {
+            await AnsiConsole.Progress()
+                .Columns(new TaskDescriptionColumn(), new ProgressBarColumn(), new PercentageColumn(), new DownloadedColumn(), new TransferSpeedColumn())
+                .StartAsync(async ctx =>
                 {
-                    if (p.Total is { } t) task.MaxValue = t;
-                    task.Value = p.Done;
-                }), ct);
-                task.Value = task.MaxValue;
-            });
+                    var task = ctx.AddTask("Downloading ffmpeg [grey](Esc to cancel)[/]", maxValue: 100_000_000);
+                    await FfmpegInstaller.InstallAsync(new Progress<(long Done, long? Total)>(p =>
+                    {
+                        if (p.Total is { } t) task.MaxValue = t;
+                        task.Value = p.Done;
+                    }), job.Token);
+                    task.Value = task.MaxValue;
+                });
+        }
+        catch (OperationCanceledException)
+        {
+            AnsiConsole.MarkupLine("[yellow]Download cancelled.[/]");
+            return null;
+        }
+        finally
+        {
+            stop.Cancel();
+            await watcher;
+        }
 
         tools = ToolLocator.TryLocate();
         if (tools is null) throw new InvalidOperationException("ffmpeg was downloaded but could not be found afterwards.");
@@ -86,122 +119,194 @@ internal static class Program
     // ── choosing a file ─────────────────────────────────────────────────────
     private static string PickSource()
     {
-        var how = AnsiConsole.Prompt(new SelectionPrompt<string>()
-            .Title("[bold]Which video do you want to crop?[/]")
-            .AddChoices("Browse a folder", "Paste or drag in a file path"));
-
-        if (how.StartsWith("Paste"))
-        {
-            return PathInput.Clean(AnsiConsole.Prompt(new TextPrompt<string>("Path to the [orange1]video file[/]:")
-                .Validate(p => File.Exists(PathInput.Clean(p)) ? ValidationResult.Success() : ValidationResult.Error("[red]That file doesn't exist.[/]"))));
-        }
-
-        var defaultFolder = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), "Downloads");
+        var folder = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), "Downloads");
         while (true)
         {
-            var folder = PathInput.Clean(AnsiConsole.Prompt(new TextPrompt<string>("Folder to look in:")
-                .DefaultValue(defaultFolder)
-                .Validate(p => Directory.Exists(PathInput.Clean(p)) ? ValidationResult.Success() : ValidationResult.Error("[red]That folder doesn't exist.[/]"))));
-            var videos = new DirectoryInfo(folder).EnumerateFiles().Where(f => PathInput.IsVideo(f.Name))
-                .OrderByDescending(f => f.LastWriteTime).ToList();
-            if (videos.Count == 0)
+            var how = Prompts.Select("Which video do you want to crop?",
+                new[] { "Browse a folder", "Paste or drag in a file path" }, h => h);
+            try
             {
-                AnsiConsole.MarkupLine("[yellow]No videos in that folder — try another.[/]");
-                defaultFolder = folder;
-                continue;
+                if (how.StartsWith("Paste")) return AskFilePath();
+
+                while (true)
+                {
+                    folder = Prompts.Ask<string>("Folder to look in:", folder, s =>
+                    {
+                        var c = PathInput.Clean(s);
+                        return Directory.Exists(c) ? (c, null) : (null, "That folder doesn't exist.");
+                    })!;
+                    var videos = new DirectoryInfo(folder).EnumerateFiles().Where(f => PathInput.IsVideo(f.Name))
+                        .OrderByDescending(f => f.LastWriteTime).ToList();
+                    if (videos.Count == 0)
+                    {
+                        AnsiConsole.MarkupLine("[yellow]No videos in that folder — try another.[/]");
+                        continue;
+                    }
+                    try
+                    {
+                        return Prompts.Select($"Pick a video [grey]({videos.Count} found, newest first)[/]", videos,
+                            f => $"{Markup.Escape(f.Name)}  [grey]{Size(f.Length)} · {f.LastWriteTime:yyyy-MM-dd HH:mm}[/]").FullName;
+                    }
+                    catch (BackException) { /* back to the folder prompt */ }
+                }
             }
-            var pick = AnsiConsole.Prompt(new SelectionPrompt<FileInfo>()
-                .Title($"[bold]Pick a video[/] [grey]({videos.Count} found, newest first)[/]")
-                .PageSize(12).MoreChoicesText("[grey](↑↓ for more)[/]")
-                .UseConverter(f => $"{Markup.Escape(f.Name)}  [grey]{Size(f.Length)} · {f.LastWriteTime:yyyy-MM-dd HH:mm}[/]")
-                .AddChoices(videos));
-            return pick.FullName;
+            catch (BackException) { /* back to "how" */ }
         }
     }
 
-    // ── one crop job ────────────────────────────────────────────────────────
-    private static async Task RunOneAsync(CropService svc, string source, CancellationToken ct)
+    private static string AskFilePath() =>
+        Prompts.Ask<string>("Path to the [orange1]video file[/]:", "", s =>
+        {
+            var c = PathInput.Clean(s);
+            return File.Exists(c) ? (c, null) : (null, "That file doesn't exist.");
+        })!;
+
+    // ── one crop job: a small step machine so Esc always steps back ─────────
+    private enum Step { Mode, Size, Anchor, Confirm }
+
+    private static async Task RunOneAsync(CropService svc, string source)
     {
-        var info = await AnsiConsole.Status().Spinner(Spinner.Known.Dots).StartAsync("Reading video…", _ => svc.ProbeAsync(source, ct));
+        var info = await AnsiConsole.Status().Spinner(Spinner.Known.Dots).StartAsync("Reading video…", _ => svc.ProbeAsync(source));
         ShowInfo(source, info);
 
-        var mode = AnsiConsole.Prompt(new SelectionPrompt<CropMode>()
-            .Title("[bold]How should it be cropped?[/]")
-            .UseConverter(m => m == CropMode.Smart
-                ? "[orange1]Smart[/]  – find the picture, trim the empty space, fit it to my width × height"
-                : "[orange1]Exact[/]  – cut a precise width × height window out of the frame")
-            .AddChoices(CropMode.Smart, CropMode.Exact));
-
+        var mode = CropMode.Smart;
         DetectedContent? content = null;
-        if (mode == CropMode.Smart)
-        {
-            content = await AnsiConsole.Status().Spinner(Spinner.Known.Dots)
-                .StartAsync("Looking for the picture inside the frame…", _ => svc.DetectContentAsync(source, info, ct));
-            if (content is null || content.Box.Area >= (long)info.Width * info.Height * 99 / 100)
-            {
-                AnsiConsole.MarkupLine("[yellow]No empty border found — the picture fills the whole frame.[/]");
-                content = new DetectedContent(new CropBox(0, 0, info.Width, info.Height), content?.PadColor ?? "black");
-            }
-            else
-            {
-                var b = content.Box;
-                AnsiConsole.MarkupLine($"[green]✔ Picture found:[/] {b.Width}×{b.Height} at ({b.X}, {b.Y})  [grey]on a {content.PadColor} background[/]");
-            }
-        }
+        int? w = null, h = null;
+        var anchor = Anchor.Center;
+        int x = 0, y = 0;
+        CropPlan? plan = null;
+        var step = Step.Mode;
 
-        CropPlan plan;
         while (true)
         {
-            var defW = (content?.Box.Width ?? info.Width) & ~1;
-            var defH = (content?.Box.Height ?? info.Height) & ~1;
-            var w = AskEven("Output [orange1]width[/]  (px):", defW);
-            var h = AskEven("Output [orange1]height[/] (px):", defH);
-            try
+            switch (step)
             {
-                if (mode == CropMode.Smart) plan = CropPlanner.Smart(content!.Box, w, h, content.PadColor);
-                else
-                {
-                    var anchor = AnsiConsole.Prompt(new SelectionPrompt<Anchor>().Title("Where should the window sit?")
-                        .UseConverter(a => a switch { Anchor.Center => "Centered", Anchor.TopLeft => "Top-left corner", _ => "Custom X, Y" })
-                        .AddChoices(Anchor.Center, Anchor.TopLeft, Anchor.Custom));
-                    var (x, y) = anchor == Anchor.Custom
-                        ? (AnsiConsole.Prompt(new TextPrompt<int>("X offset:").DefaultValue(0)), AnsiConsole.Prompt(new TextPrompt<int>("Y offset:").DefaultValue(0)))
-                        : (0, 0);
-                    plan = CropPlanner.Exact(info, w, h, anchor, x, y);
-                }
-                break;
-            }
-            catch (ArgumentException ex)
-            {
-                AnsiConsole.MarkupLine($"[red]✘ {Markup.Escape(ex.Message)}[/] Let's try again.\n");
+                case Step.Mode:
+                    mode = Prompts.Select("How should it be cropped?", new[] { CropMode.Smart, CropMode.Exact },
+                        m => m == CropMode.Smart
+                            ? "[orange1]Smart[/]  – find the picture, trim the empty space, fit it to my width × height"
+                            : "[orange1]Exact[/]  – cut a precise width × height window out of the frame",
+                        initial: mode == CropMode.Smart ? 0 : 1);
+                    if (mode == CropMode.Smart && content is null) content = await DetectAsync(svc, source, info);
+                    step = Step.Size;
+                    break;
+
+                case Step.Size:
+                    try
+                    {
+                        var defW = w ?? ((mode == CropMode.Smart ? content!.Box.Width : info.Width) & ~1);
+                        var defH = h ?? ((mode == CropMode.Smart ? content!.Box.Height : info.Height) & ~1);
+                        w = AskEven("Output [orange1]width[/]  (px):", defW);
+                        h = AskEven("Output [orange1]height[/] (px):", defH);
+                    }
+                    catch (BackException) { step = Step.Mode; break; }
+                    step = mode == CropMode.Exact ? Step.Anchor : Step.Confirm;
+                    if (mode == CropMode.Smart && !TryPlan(() => CropPlanner.Smart(content!.Box, w!.Value, h!.Value, content.PadColor), out plan))
+                        step = Step.Size;
+                    break;
+
+                case Step.Anchor:
+                    try
+                    {
+                        anchor = Prompts.Select("Where should the window sit?",
+                            new[] { Anchor.Center, Anchor.TopLeft, Anchor.Custom },
+                            a => a switch { Anchor.Center => "Centered", Anchor.TopLeft => "Top-left corner", _ => "Custom X, Y" },
+                            initial: (int)anchor);
+                        if (anchor == Anchor.Custom)
+                        {
+                            x = AskInt("X offset:", x);
+                            y = AskInt("Y offset:", y);
+                        }
+                    }
+                    catch (BackException) { step = Step.Size; break; }
+                    step = TryPlan(() => CropPlanner.Exact(info, w!.Value, h!.Value, anchor, x, y), out plan) ? Step.Confirm : Step.Size;
+                    break;
+
+                case Step.Confirm:
+                    var output = OutputNamer.Next(source, File.Exists);
+                    ShowPlan(plan!, info, output);
+                    bool go;
+                    try { go = Prompts.Confirm("Start cropping?"); }
+                    catch (BackException) { step = mode == CropMode.Exact ? Step.Anchor : Step.Size; break; }
+                    if (!go) { step = Step.Size; break; }
+                    await CropWithProgressAsync(svc, source, output, plan!, info);
+                    return;
             }
         }
+    }
 
-        var output = OutputNamer.Next(source, File.Exists);
-        ShowPlan(plan, info, output);
-        if (!AnsiConsole.Confirm("Start cropping?")) return;
+    private static async Task<DetectedContent> DetectAsync(CropService svc, string source, VideoInfo info)
+    {
+        var content = await AnsiConsole.Status().Spinner(Spinner.Known.Dots)
+            .StartAsync("Looking for the picture inside the frame…", _ => svc.DetectContentAsync(source, info));
+        if (content is null || content.Box.Area >= (long)info.Width * info.Height * 99 / 100)
+        {
+            AnsiConsole.MarkupLine("[yellow]No empty border found — the picture fills the whole frame.[/]");
+            return new DetectedContent(new CropBox(0, 0, info.Width, info.Height), content?.PadColor ?? "black");
+        }
+        var b = content.Box;
+        AnsiConsole.MarkupLine($"[green]✔ Picture found:[/] {b.Width}×{b.Height} at ({b.X}, {b.Y})  [grey]on a {content.PadColor} background[/]");
+        return content;
+    }
 
-        await AnsiConsole.Progress()
-            .Columns(new TaskDescriptionColumn(), new ProgressBarColumn(), new PercentageColumn(), new ElapsedTimeColumn(), new RemainingTimeColumn())
-            .StartAsync(async ctx =>
-            {
-                var task = ctx.AddTask("Cropping", maxValue: 1);
-                await svc.CropAsync(source, output, plan, info, new Progress<double>(v => task.Value = v), ct);
-            });
+    private static bool TryPlan(Func<CropPlan> build, out CropPlan? plan)
+    {
+        try { plan = build(); return true; }
+        catch (ArgumentException ex)
+        {
+            AnsiConsole.MarkupLine($"[red]✘ {Markup.Escape(ex.Message)}[/] Let's try again.\n");
+            plan = null;
+            return false;
+        }
+    }
+
+    private static async Task CropWithProgressAsync(CropService svc, string source, string output, CropPlan plan, VideoInfo info)
+    {
+        using var job = new CancellationTokenSource();
+        using var stop = new CancellationTokenSource();
+        var watcher = Prompts.Watch(job, stop.Token);
+        try
+        {
+            await AnsiConsole.Progress()
+                .Columns(new TaskDescriptionColumn(), new ProgressBarColumn(), new PercentageColumn(), new ElapsedTimeColumn(), new RemainingTimeColumn())
+                .StartAsync(async ctx =>
+                {
+                    var task = ctx.AddTask("Cropping [grey](Esc to cancel)[/]", maxValue: 1);
+                    await svc.CropAsync(source, output, plan, info, new Progress<double>(v => task.Value = v), job.Token);
+                });
+        }
+        catch (OperationCanceledException)
+        {
+            AnsiConsole.MarkupLine("[yellow]Cropping cancelled — nothing was saved.[/]");
+            return;
+        }
+        finally
+        {
+            stop.Cancel();
+            await watcher;
+        }
 
         AnsiConsole.Write(new Panel(new Rows(
-                new Markup($"[green bold]✔ Done[/]"),
+                new Markup("[green bold]✔ Done[/]"),
                 new Markup($"[grey]File:[/]  [blue]{Markup.Escape(output)}[/]"),
                 new Markup($"[grey]Size:[/]  {plan.OutWidth}×{plan.OutHeight}  ·  {Size(new FileInfo(output).Length)}  ·  audio {(info.AudioCodec is null ? "none" : "kept")}")))
             .Border(BoxBorder.Rounded).BorderColor(Color.Green).Padding(1, 0));
 
-        if (AnsiConsole.Confirm("Show it in Explorer?", defaultValue: false))
-            System.Diagnostics.Process.Start("explorer.exe", $"/select,\"{output}\"");
+        try
+        {
+            if (Prompts.Confirm("Show it in Explorer?", defaultYes: false))
+                System.Diagnostics.Process.Start("explorer.exe", $"/select,\"{output}\"");
+        }
+        catch (BackException) { }
     }
 
     private static int AskEven(string prompt, int def) =>
-        AnsiConsole.Prompt(new TextPrompt<int>(prompt).DefaultValue(def)
-            .Validate(v => v > 0 && v % 2 == 0 ? ValidationResult.Success() : ValidationResult.Error("[red]Use a positive, even number.[/]")));
+        Prompts.Ask(prompt, def.ToString(), s =>
+            int.TryParse(s.Trim(), out var v) && v > 0 && v % 2 == 0 ? (v, null) : (0, "Use a positive, even whole number."));
+
+    private static int AskInt(string prompt, int def) =>
+        Prompts.Ask(prompt, def.ToString(), s =>
+            int.TryParse(s.Trim(), out var v) && v >= 0 ? (v, null) : (0, "Use a whole number, 0 or more."));
 
     private static void ShowInfo(string path, VideoInfo i)
     {
@@ -232,3 +337,4 @@ internal static class Program
         _ => $"{bytes / 1024.0:0} KB",
     };
 }
+

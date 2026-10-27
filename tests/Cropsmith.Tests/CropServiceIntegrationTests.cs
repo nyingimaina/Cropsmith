@@ -61,3 +61,36 @@ public class CropServiceIntegrationTests : IDisposable
             svc.CropAsync(Path.Combine(_dir, "missing.mp4"), Path.Combine(_dir, "o.mp4"), plan, info));
     }
 }
+
+public class CropServiceCancellationTests : IDisposable
+{
+    private readonly string _dir = Path.Combine(Path.GetTempPath(), "cropsmith-cx-" + Guid.NewGuid().ToString("N"));
+    public CropServiceCancellationTests() => Directory.CreateDirectory(_dir);
+    public void Dispose() => Directory.Delete(_dir, true);
+
+    [Fact]
+    public async Task CancelledCrop_ThrowsCancelled_AndLeavesNoPartialFile()
+    {
+        var tools = ToolLocator.TryLocate();
+        if (tools is null) return;
+        var svc = new CropService(tools.Value.Ffmpeg, tools.Value.Ffprobe);
+
+        var src = Path.Combine(_dir, "long.mp4");
+        var made = await ProcessRunner.RunAsync(tools.Value.Ffmpeg, new[]
+        {
+            "-hide_banner", "-loglevel", "error", "-y",
+            "-f", "lavfi", "-i", "testsrc=s=1280x720:d=120:r=30",
+            "-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p", src,
+        });
+        Assert.Equal(0, made.ExitCode);
+
+        var info = await svc.ProbeAsync(src);
+        var plan = CropPlanner.Exact(info, 640, 360, Anchor.Center);
+        var dst = Path.Combine(_dir, "out.mp4");
+        using var cts = new CancellationTokenSource();
+        cts.CancelAfter(600);
+
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => svc.CropAsync(src, dst, plan, info, null, cts.Token));
+        Assert.False(File.Exists(dst));
+    }
+}

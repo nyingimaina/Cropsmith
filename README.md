@@ -26,3 +26,16 @@ MP4-compatible, otherwise re-encoded to AAC. Video is H.264 CRF 14.
 ## Tests
 
     dotnet test
+
+## Keys
+
+| Key | Does |
+| --- | --- |
+| Enter | confirm / select |
+| Esc | go back one step (on the first screen: asks to quit); cancels a running crop or download |
+| Ctrl+C, Ctrl+Q | quit from anywhere (cancels a running crop) |
+| Q | quit, on selection lists |
+| ↑ ↓ Home End PgUp PgDn | move in lists |
+| ← → Home End Del Backspace, Ctrl+U | edit text/number fields; Ctrl+U clears |
+
+A cancelled crop deletes its partial output file.

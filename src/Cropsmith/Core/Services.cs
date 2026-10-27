@@ -31,7 +31,7 @@ public static class ProcessRunner
         p.BeginOutputReadLine();
         p.BeginErrorReadLine();
         try { await p.WaitForExitAsync(ct); }
-        catch (OperationCanceledException) { try { p.Kill(true); } catch { } throw; }
+        catch (OperationCanceledException) { try { p.Kill(true); p.WaitForExit(); } catch { } throw; }
         p.WaitForExit(); // flush async readers
         return new ProcessResult(p.ExitCode, so.ToString(), se.ToString());
     }
@@ -139,11 +139,20 @@ public sealed class CropService(string ffmpeg, string ffprobe)
         IProgress<double>? progress = null, CancellationToken ct = default)
     {
         var args = FfmpegArgsBuilder.Build(input, output, FilterBuilder.Build(plan), info);
-        var r = await ProcessRunner.RunAsync(ffmpeg, args, line =>
+        ProcessResult r;
+        try
         {
-            if (progress is not null && info.Duration > TimeSpan.Zero && ProgressParser.TryGetElapsed(line, out var t))
-                progress.Report(Math.Clamp(t / info.Duration, 0, 1));
-        }, ct);
+            r = await ProcessRunner.RunAsync(ffmpeg, args, line =>
+            {
+                if (progress is not null && info.Duration > TimeSpan.Zero && ProgressParser.TryGetElapsed(line, out var t))
+                    progress.Report(Math.Clamp(t / info.Duration, 0, 1));
+            }, ct);
+        }
+        catch (OperationCanceledException)
+        {
+            try { File.Delete(output); } catch { }
+            throw;
+        }
 
         if (r.ExitCode != 0)
         {
@@ -153,4 +162,5 @@ public sealed class CropService(string ffmpeg, string ffprobe)
         progress?.Report(1);
     }
 }
+
 
