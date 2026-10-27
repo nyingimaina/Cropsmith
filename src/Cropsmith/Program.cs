@@ -60,7 +60,7 @@ internal static class Program
     private static void Banner()
     {
         AnsiConsole.Write(new FigletText("Cropsmith").Color(Color.Orange1));
-        AnsiConsole.Write(new Rule("[grey]forge your video to the exact frame · picture and sound stay intact[/]").RuleStyle("grey").LeftJustified());
+        AnsiConsole.Write(new Rule($"[grey]forge your video to the exact frame · picture and sound stay intact · {BuildStamp.Current()}[/]").RuleStyle("grey").LeftJustified());
         AnsiConsole.MarkupLine("[grey]Keys: [bold]Enter[/] confirm · [bold]Esc[/] go back / cancel · [bold]Ctrl+C[/] or [bold]Q[/] quit[/]\n");
     }
 
